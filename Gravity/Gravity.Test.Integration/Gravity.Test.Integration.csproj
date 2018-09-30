@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <TestProjectType>UnitTest</TestProjectType>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemGroup>
+    <ProjectReference Include="..\Gravity.Test\Gravity.Test.csproj" />
+    <ProjectReference Include="..\Gravity\Gravity.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="NUnit" Version="3.10.1" />
+    <!--Relativity dependencies for integration tests need higher version so don't run into kCura.Config vs kCura issues-->
+    <PackageReference Include="Relativity.Other" Version="9.5.162.111" />
+    <PackageReference Include="Relativity.ObjectManager" Version="9.5.162.111" />
+    <PackageReference Include="Relativity.Api" Version="9.5.162.111" />
+    <PackageReference Include="Relativity.Rsapi" Version="9.5.162.111" />
+    <PackageReference Include="RelativityDev.DbContextHelper" Version="2.0.0.4" />
+    <PackageReference Include="RelativityTestHelpersNuget" Version="1.3.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System.Configuration" />
+    <Reference Include="System.Data.DataSetExtensions" />
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="App.config">
+      <SubType>Designer</SubType>
+    </None>
+  </ItemGroup>
+</Project>

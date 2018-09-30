@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Reflection;
 
 namespace Gravity.Extensions
@@ -18,22 +19,18 @@ namespace Gravity.Extensions
 			return attr.ObjectTypeGuid;
 		}
 
-		public static T GetAttributeOfTypeFromEnum<T>(this Enum enumVal) where T : System.Attribute
+		public static Dictionary<T1, T2> GetAttributesForValues<T1, T2>() where T2: Attribute
 		{
-			var type = enumVal.GetType();
-			var memInfo = type.GetMember(enumVal.ToString());
-			var attributes = memInfo[0].GetCustomAttributes(typeof(T), false);
-			return (attributes.Length > 0) ? (T)attributes[0] : null;
-		}
+			if (!typeof(T1).IsEnum)
+			{
+				throw new NotSupportedException($"{typeof(T1).Name} does not represent an enumeration");
+			}
 
-		public static string GetDescriptionAttributeValue(this Enum enumVal)
-		{
-			var type = enumVal.GetType();
-			var memInfo = type.GetMember(enumVal.ToString());
-			var attribute = memInfo[0].GetCustomAttributes(typeof(DescriptionAttribute), true)[0];
-			var description = (DescriptionAttribute)attribute;
-
-			return description.Description;
+			var type = typeof(T1);
+			return Enum.GetNames(type).ToDictionary(
+				x => (T1)Enum.Parse(type, x),
+				x => type.GetField(x).GetCustomAttribute<T2>()
+			);
 		}
 	}
 }

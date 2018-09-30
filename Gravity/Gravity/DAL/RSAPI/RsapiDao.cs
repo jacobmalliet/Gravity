@@ -1,50 +1,43 @@
-﻿using kCura.Relativity.Client;
-using Relativity.API;
+﻿using System;
 using Gravity.Globals;
 using Gravity.Utils;
+using Relativity.API;
 
 namespace Gravity.DAL.RSAPI
 {
-	using System;
-
-	public partial class RsapiDao
+	public partial class RsapiDao : IGravityDao
 	{
-		public ExecutionIdentity CurrentExecutionIdentity { get; set; }
+		private const int DefaultBatchSize = 1000;
 
-		protected IHelper helper;
-		protected int workspaceId;
-		
-		private InvokeWithRetryService invokeWithRetryService;
+		protected InvokeWithRetryService invokeWithRetryService;
+		protected IRsapiProvider rsapiProvider;
+		protected ChoiceCache choiceCache;
+		protected ArtifactGuidCache guidCache;
+		protected FileMD5Cache fileMd5Cache;
 
-		protected IRSAPIClient CreateProxy()
+		public RsapiDao(IServicesMgr servicesManager, int workspaceId, ExecutionIdentity executionIdentity,
+				InvokeWithRetrySettings invokeWithRetrySettings = null,
+				int batchSize = DefaultBatchSize)
+			: this(servicesManager, workspaceId, executionIdentity, InvokeWithRetryService.GetInvokeWithRetryService(invokeWithRetrySettings), batchSize)
+
 		{
-			var proxy = helper.GetServicesManager().CreateProxy<IRSAPIClient>(this.CurrentExecutionIdentity);
-			proxy.APIOptions.WorkspaceID = workspaceId;
-
-			return proxy;
-		}
-		
-		public RsapiDao(IHelper helper, int workspaceId, ExecutionIdentity executionIdentity, InvokeWithRetrySettings invokeWithRetrySettings = null)
-		{
-			this.helper = helper;
-			this.workspaceId = workspaceId;
-			this.CurrentExecutionIdentity = executionIdentity;
-
-			if (invokeWithRetrySettings == null)
-			{
-				InvokeWithRetrySettings defaultSettings = new InvokeWithRetrySettings(SharedConstants.retryAttempts, SharedConstants.sleepTimeInMiliseconds);
-				this.invokeWithRetryService = new InvokeWithRetryService(defaultSettings);
-			}
-			else
-			{
-				this.invokeWithRetryService = new InvokeWithRetryService(invokeWithRetrySettings);
-			}
 		}
 
-		[Obsolete("This constructor has been deprecated. Use RsapiDao(IHelper helper, int workspaceId, ExecutionIdentity executionIdentity, InvokeWithRetrySettings invokeWithRetrySettings) instead.")]
-		public RsapiDao(IHelper helper, int workspaceId, InvokeWithRetrySettings invokeWithRetrySettings = null)
-			: this(helper, workspaceId, ExecutionIdentity.System, invokeWithRetrySettings)
+		private RsapiDao(IServicesMgr servicesManager, int workspaceId, ExecutionIdentity executionIdentity,
+				InvokeWithRetryService invokeWithRetryService,
+				int batchSize = DefaultBatchSize)
+			: this(new RsapiProvider(servicesManager, executionIdentity, invokeWithRetryService, workspaceId, batchSize), invokeWithRetryService)
 		{
+		}
+
+		public RsapiDao(IRsapiProvider rsapiProvider, InvokeWithRetryService invokeWithRetryService)
+		{
+			this.invokeWithRetryService = invokeWithRetryService;
+
+			this.rsapiProvider = rsapiProvider;
+			this.choiceCache = new ChoiceCache(this.rsapiProvider);
+			this.guidCache = new ArtifactGuidCache(this.rsapiProvider);
+			this.fileMd5Cache = new FileMD5Cache(this.rsapiProvider);
 		}
 	}
 }

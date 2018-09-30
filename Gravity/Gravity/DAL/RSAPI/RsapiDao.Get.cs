@@ -3,9 +3,11 @@ using kCura.Relativity.Client.DTOs;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Gravity.Base;
 using Gravity.Exceptions;
 using Gravity.Extensions;
@@ -14,370 +16,240 @@ namespace Gravity.DAL.RSAPI
 {
 	public partial class RsapiDao
 	{
-		#region RDO GET Protected stuff
+		#region RDO GET Protected stuff		
 		protected RDO GetRdo(int artifactId)
 		{
-			RDO returnObject = null;
-
-			using (IRSAPIClient proxyToWorkspace = CreateProxy())
-			{
-				try
-				{
-					returnObject = invokeWithRetryService.InvokeWithRetry(() => proxyToWorkspace.Repositories.RDO.ReadSingle(artifactId));
-				}
-				catch (Exception ex)
-				{
-					throw new ProxyOperationFailedException("Failed in method: " + System.Reflection.MethodInfo.GetCurrentMethod(), ex);
-				}
-			}
-
-			return returnObject;
+			return rsapiProvider.ReadSingle(artifactId);
 		}
 
 		protected List<RDO> GetRdos(int[] artifactIds)
 		{
-			ResultSet<RDO> resultSet = new ResultSet<RDO>();
-			using (IRSAPIClient proxyToWorkspace = CreateProxy())
-			{
-				try
-				{
-					resultSet = invokeWithRetryService.InvokeWithRetry(() => proxyToWorkspace.Repositories.RDO.Read(artifactIds));
-				}
-				catch (Exception ex)
-				{
-					throw new ProxyOperationFailedException("Failed in method: " + System.Reflection.MethodInfo.GetCurrentMethod(), ex);
-				}
-			}
-
-			if (resultSet.Success == false)
-			{
-				throw new ArgumentException(resultSet.Message);
-			}
-
-			return resultSet.Results.Select(items => items.Artifact).ToList();
+			return artifactIds.Any()
+				? rsapiProvider.Read(artifactIds).GetResultData()
+				: new List<RDO>();
 		}
 
-		protected List<RDO> GetRdos<T>(Condition queryCondition = null)
+		protected IEnumerable<RDO> GetRdos<T>(Condition queryCondition = null)
 			where T : BaseDto
 		{
 			Query<RDO> query = new Query<RDO>()
 			{
 				ArtifactTypeGuid = BaseDto.GetObjectTypeGuid<T>(),
-				Condition = queryCondition
+				Condition = queryCondition,
+				Fields = BaseDto.GetFieldsGuids<T>().Select(x => new FieldValue(x)).ToList()
 			};
 
-			query.Fields = FieldValue.AllFields;
-
-			QueryResultSet<RDO> results;
-			using (IRSAPIClient proxyToWorkspace = CreateProxy())
-			{
-				try
-				{
-					results = invokeWithRetryService.InvokeWithRetry(() => proxyToWorkspace.Repositories.RDO.Query(query));
-				}
-				catch (Exception ex)
-				{
-					throw new ProxyOperationFailedException("Failed in method: " + System.Reflection.MethodInfo.GetCurrentMethod(), ex);
-				}
-			}
-
-			if (results.Success == false)
-			{
-				throw new ArgumentException(results.Message);
-			}
-
-			return results.Results.Select<Result<RDO>, RDO>(result => result.Artifact as RDO).ToList();
+			return rsapiProvider.Query(query).SelectMany(x => x.GetResultData());
 		}
 
-		protected RelativityFile GetFile(int fileFieldArtifactId, int ourFileContainerInstanceArtifactId)
+		protected ByteArrayFileDto GetFile(Guid fieldGuid, int objectArtifactId)
 		{
-			using (IRSAPIClient proxyToWorkspace = CreateProxy())
+			//TODO: cache this?
+			var fileFieldArtifactId = this.guidCache.Get(fieldGuid);
+
+			(var fileMetadata, var fileStream) = rsapiProvider.DownloadFile(fileFieldArtifactId, objectArtifactId);
+
+			using (fileStream)
 			{
-				try
+				var fileDto = new ByteArrayFileDto
 				{
-					var fileRequest = new FileRequest(proxyToWorkspace.APIOptions);
-					fileRequest.Target.FieldId = fileFieldArtifactId;
-					fileRequest.Target.ObjectArtifactId = ourFileContainerInstanceArtifactId;
-
-					RelativityFile returnValue;
-					var fileData = invokeWithRetryService.InvokeWithRetry(() => proxyToWorkspace.Download(fileRequest));
-
-					using (MemoryStream ms = (MemoryStream)fileData.Value)
-					{
-						FileValue fileValue = new FileValue(null, ms.ToArray());
-						FileMetadata fileMetadata = fileData.Key.Metadata;
-
-						returnValue = new RelativityFile(fileFieldArtifactId, fileValue, fileMetadata);
-					}
-
-					return returnValue;
-				}
-				catch (Exception ex)
-				{
-					throw new ProxyOperationFailedException("Failed in method: " + System.Reflection.MethodInfo.GetCurrentMethod(), ex);
-				}
+					ByteArray = fileStream.ToArray(),
+					FileName = fileMetadata.FileName
+				};
+				fileMd5Cache.Set(fieldGuid, objectArtifactId, fileDto.GetMD5());
+				return fileDto;
 			}
 		}
+
 		#endregion
 
-		public List<T> GetAllDTOs<T>()
+		public IEnumerable<T> Query<T>(Condition queryCondition = null, ObjectFieldsDepthLevel depthLevel = ObjectFieldsDepthLevel.FirstLevelOnly)
 			where T : BaseDto, new()
 		{
-			List<RDO> objectsRdos = GetRdos<T>();
-
-			return objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
+			IEnumerable<RDO> objectsRdos = GetRdos<T>(queryCondition);
+			return objectsRdos.Select(rdo => GetHydratedDTO<T>(rdo, depthLevel));
 		}
 
-		public List<T> GetAllDTOs<T>(Condition queryCondition = null, ObjectFieldsDepthLevel depthLevel = ObjectFieldsDepthLevel.FirstLevelOnly)
-			where T : BaseDto, new()
+		private List<int> GetAllChildIds<T>(params int[] parentArtifactIDs) where T : BaseDto
 		{
-			List<T> returnList = null;
+			var parentFieldGuid = typeof(T)
+				.GetPropertyAttributeTuples<RelativityObjectFieldParentArtifactIdAttribute>()
+				.First().Item2.FieldGuid;
 
-			List<RDO> objectsRdos = GetRdos<T>(queryCondition);
-
-			switch (depthLevel)
+			Condition queryCondition = new WholeNumberCondition(parentFieldGuid, NumericConditionEnum.In, parentArtifactIDs);
+			Query<RDO> query = new Query<RDO>()
 			{
-				case ObjectFieldsDepthLevel.FirstLevelOnly:
-					returnList = objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
-					break;
-				case ObjectFieldsDepthLevel.FullyRecursive:
-					var allDtos = new List<T>();
+				ArtifactTypeGuid = BaseDto.GetObjectTypeGuid<T>(),
+				Condition = queryCondition,
+			};
 
-					foreach (var rdo in objectsRdos)
-					{
-						var dto = rdo.ToHydratedDto<T>();
-
-						PopulateChildrenRecursively<T>(dto, rdo, depthLevel);
-
-						allDtos.Add(dto);
-					}
-
-					returnList = allDtos;
-					break;
-				default:
-					return objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
-
-			}
-
-			return returnList;
+			return rsapiProvider.Query(query).SelectMany(x => x.GetResultData()).Select(x => x.ArtifactID).ToList();
 		}
 
-		public List<T> GetAllChildDTOs<T>(Guid parentFieldGuid, int parentArtifactID, ObjectFieldsDepthLevel depthLevel)
+		internal IEnumerable<T> GetAllChildDTOs<T>(int parentArtifactID, ObjectFieldsDepthLevel depthLevel)
 			where T : BaseDto, new()
 		{
-			Condition queryCondition = new WholeNumberCondition(parentFieldGuid, NumericConditionEnum.EqualTo, parentArtifactID);
-			List<RDO> objectsRdos = GetRdos<T>(queryCondition);
+			var parentFieldGuid = typeof(T)
+				.GetPropertyAttributeTuples<RelativityObjectFieldParentArtifactIdAttribute>()
+				.First().Item2.FieldGuid;
 
-			switch (depthLevel)
-			{
-				case ObjectFieldsDepthLevel.FirstLevelOnly:
-					return objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
-				case ObjectFieldsDepthLevel.FullyRecursive:
-					var allChildDtos = new List<T>();
-					foreach (var childRdo in objectsRdos)
-					{
-						var childDto = childRdo.ToHydratedDto<T>();
-
-						PopulateChildrenRecursively<T>(childDto, childRdo, depthLevel);
-
-						allChildDtos.Add(childDto);
-					}
-					return allChildDtos;
-				default:
-					return objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
-			}
+			return Query<T>(new WholeNumberCondition(parentFieldGuid, NumericConditionEnum.EqualTo, parentArtifactID), depthLevel);
 		}
 
-		public List<T> GetDTOs<T>(int[] artifactIDs, ObjectFieldsDepthLevel depthLevel)
+		public List<T> Get<T>(IList<int> artifactIDs, ObjectFieldsDepthLevel depthLevel)
 			where T : BaseDto, new()
 		{
-			List<RDO> objectsRdos = GetRdos(artifactIDs);
-			switch (depthLevel)
-			{
-				case ObjectFieldsDepthLevel.FirstLevelOnly:
-					return objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
-				case ObjectFieldsDepthLevel.FullyRecursive:
-					var allDtos = new List<T>();
-
-					foreach (var rdo in objectsRdos)
-					{
-						var dto = rdo.ToHydratedDto<T>();
-
-						PopulateChildrenRecursively<T>(dto, rdo, depthLevel);
-
-						allDtos.Add(dto);
-					}
-
-					return allDtos;
-				default:
-					return objectsRdos.Select<RDO, T>(rdo => rdo.ToHydratedDto<T>()).ToList();
-			}
+			List<RDO> objectsRdos = GetRdos(artifactIDs.ToArray());
+			return objectsRdos.Select(rdo => GetHydratedDTO<T>(rdo, depthLevel)).ToList();
 		}
 
-		internal T GetDTO<T>(int artifactID, ObjectFieldsDepthLevel depthLevel)
+		public T Get<T>(int artifactID, ObjectFieldsDepthLevel depthLevel)
 			where T : BaseDto, new()
 		{
 			RDO objectRdo = GetRdo(artifactID);
 
+			return GetHydratedDTO<T>(objectRdo, depthLevel);
+		}
+
+		private T GetHydratedDTO<T>(RDO objectRdo, ObjectFieldsDepthLevel depthLevel)
+			where T : BaseDto, new()
+		{
+			T dto = objectRdo.ToHydratedDto<T>();
+			PopulateChoices(dto, objectRdo);
+			PopulateFiles(dto, objectRdo);
 			switch (depthLevel)
 			{
+				case ObjectFieldsDepthLevel.OnlyParentObject:
+					break;
 				case ObjectFieldsDepthLevel.FirstLevelOnly:
-					return objectRdo.ToHydratedDto<T>();
+					PopulateChildrenRecursively<T>(dto, objectRdo, ObjectFieldsDepthLevel.OnlyParentObject);
+					break;
 				case ObjectFieldsDepthLevel.FullyRecursive:
-					T dto = objectRdo.ToHydratedDto<T>();
-					PopulateChildrenRecursively<T>(dto, objectRdo, depthLevel);
-					return dto;
+					PopulateChildrenRecursively<T>(dto, objectRdo, ObjectFieldsDepthLevel.FullyRecursive);
+					break;
 				default:
-					return objectRdo.ToHydratedDto<T>();
+					throw new ArgumentOutOfRangeException(nameof(depthLevel));
+			}
+
+			return dto;
+		}
+
+		private void PopulateChoices(BaseDto dto, RDO objectRdo)
+		{
+			foreach ((PropertyInfo property, RelativityObjectFieldAttribute fieldAttribute) 
+				in dto.GetType().GetPropertyAttributeTuples<RelativityObjectFieldAttribute>())
+			{
+				object GetEnum(Type enumType, int artifactId) => choiceCache.InvokeGenericMethod(enumType, nameof(ChoiceCache.GetEnum), artifactId);
+
+				switch (fieldAttribute.FieldType)
+				{
+					case RdoFieldType.SingleChoice:
+						{ 
+							if (objectRdo[fieldAttribute.FieldGuid].ValueAsSingleChoice?.ArtifactID is int artifactId)
+							{
+								var enumType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+								property.SetValue(dto, GetEnum(enumType, artifactId));
+							}
+						}
+						break;
+					case RdoFieldType.MultipleChoice:
+						{ 
+							var enumType = property.PropertyType.GetEnumerableInnerType();
+							var fieldValue = objectRdo[fieldAttribute.FieldGuid].ValueAsMultipleChoice?
+								.Select(x => GetEnum(enumType, x.ArtifactID))
+								.ToList();
+							if (fieldValue != null)
+							{ 
+								property.SetValue(dto, BaseExtensionMethods.MakeGenericList(fieldValue, enumType));
+							}
+						}
+						break;
+					default:
+						break;
+				}
 			}
 		}
+
+		private void PopulateFiles(BaseDto dto, RDO objectRdo)
+		{
+			foreach ((PropertyInfo property, RelativityObjectFieldAttribute fieldAttribute)
+						in dto.GetType()
+							.GetPropertyAttributeTuples<RelativityObjectFieldAttribute>()
+							.Where(x => x.Item2.FieldType == RdoFieldType.File)
+				)
+			{
+				if (objectRdo[fieldAttribute.FieldGuid].Value != null) // value is file name string, so if present will show up
+				{
+					property.SetValue(dto, this.GetFile(fieldAttribute.FieldGuid, objectRdo.ArtifactID));
+				}
+			}
+		}
+
 
 		internal void PopulateChildrenRecursively<T>(BaseDto baseDto, RDO objectRdo, ObjectFieldsDepthLevel depthLevel)
 		{
-			foreach (var objectPropertyInfo in BaseDto.GetRelativityMultipleObjectPropertyInfos<T>())
+			foreach (var objectPropertyInfo in baseDto.GetType().GetPublicProperties())
 			{
-				var propertyInfo = objectPropertyInfo.Key;
-				var theMultipleObjectAttribute = objectPropertyInfo.Value;
-
-				Type childType = objectPropertyInfo.Value.ChildType;
-
-				int[] childArtifactIds = objectRdo[objectPropertyInfo.Value.FieldGuid].GetValueAsMultipleObject<kCura.Relativity.Client.DTOs.Artifact>()
-							.Select<kCura.Relativity.Client.DTOs.Artifact, int>(artifact => artifact.ArtifactID).ToArray();
-
-				MethodInfo method = GetType().GetMethod("GetDTOs", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).MakeGenericMethod(new Type[] { childType });
-
-				var allObjects = method.Invoke(this, new object[] { childArtifactIds, depthLevel }) as IEnumerable;
-
-				var listType = typeof(List<>).MakeGenericType(theMultipleObjectAttribute.ChildType);
-				IList returnList = (IList)Activator.CreateInstance(listType);
-
-				foreach (var item in allObjects)
+				var childValue = GetChildObjectRecursively(baseDto, objectRdo, depthLevel, objectPropertyInfo);
+				if (childValue != null)
 				{
-					returnList.Add(item);
+					objectPropertyInfo.SetValue(baseDto, childValue);
 				}
-
-				propertyInfo.SetValue(baseDto, returnList);
-			}
-
-			foreach (var ObjectPropertyInfo in BaseDto.GetRelativitySingleObjectPropertyInfos<T>())
-			{
-				var propertyInfo = ObjectPropertyInfo.Key;
-
-				Type objectType = ObjectPropertyInfo.Value.ChildType;
-				var singleObject = Activator.CreateInstance(objectType);
-
-				int childArtifactId = objectRdo[ObjectPropertyInfo.Value.FieldGuid].ValueAsSingleObject.ArtifactID;
-
-				MethodInfo method = GetType().GetMethod("GetDTO", BindingFlags.NonPublic | BindingFlags.Instance).MakeGenericMethod(new Type[] { objectType });
-
-				if (childArtifactId != 0)
-				{
-					singleObject = method.Invoke(this, new object[] { childArtifactId, depthLevel });
-				}
-
-				propertyInfo.SetValue(baseDto, singleObject);
-			}
-
-			foreach (var childPropertyInfo in BaseDto.GetRelativityObjectChildrenListInfos<T>())
-			{
-				var propertyInfo = childPropertyInfo.Key;
-				var theChildAttribute = childPropertyInfo.Value;
-
-				Type childType = childPropertyInfo.Value.ChildType;
-				MethodInfo method = GetType().GetMethod("GetAllChildDTOs", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).MakeGenericMethod(new Type[] { childType });
-
-				Guid parentFieldGuid = childType.GetRelativityObjectGuidForParentField();
-
-				var allChildObjects = method.Invoke(this, new object[] { parentFieldGuid, baseDto.ArtifactId, depthLevel }) as IEnumerable;
-
-				var listType = typeof(List<>).MakeGenericType(theChildAttribute.ChildType);
-				IList returnList = (IList)Activator.CreateInstance(listType);
-
-				foreach (var item in allChildObjects)
-				{
-					returnList.Add(item);
-				}
-
-				propertyInfo.SetValue(baseDto, returnList);
-			}
-
-			foreach (var filePropertyInfo in baseDto.GetType().GetPublicProperties().Where(prop => prop.PropertyType == typeof(RelativityFile)))
-			{
-				var filePropertyValue = filePropertyInfo.GetValue(baseDto, null) as RelativityFile;
-
-				if (filePropertyValue != null)
-				{
-					filePropertyValue = GetFile(filePropertyValue.ArtifactTypeId, baseDto.ArtifactId);
-				}
-
-				filePropertyInfo.SetValue(baseDto, filePropertyValue);
 			}
 		}
 
-		public T GetRelativityObject<T>(int artifactId, ObjectFieldsDepthLevel depthLevel)
-			where T : BaseDto, new()
+		private object GetChildObjectRecursively(BaseDto baseDto, RDO objectRdo, ObjectFieldsDepthLevel depthLevel, PropertyInfo property)
 		{
-			RDO objectRdo = GetRdo(artifactId);
+			var relativityObjectFieldAttibute = property.GetCustomAttribute<RelativityObjectFieldAttribute>();
 
-			T theObject = objectRdo.ToHydratedDto<T>();
-
-			if (depthLevel != ObjectFieldsDepthLevel.OnlyParentObject)
+			if (relativityObjectFieldAttibute != null)
 			{
-				PopulateChildrenRecursively<T>(theObject, objectRdo, depthLevel);
+				var fieldType = relativityObjectFieldAttibute.FieldType;
+				var fieldGuid = relativityObjectFieldAttibute.FieldGuid;
+
+				//multiple object
+				if (fieldType == RdoFieldType.MultipleObject)
+				{
+					Type objectType = property.PropertyType.GetEnumerableInnerType();
+
+					int[] childArtifactIds = objectRdo[fieldGuid]
+						.GetValueAsMultipleObject<kCura.Relativity.Client.DTOs.Artifact>()
+						.Select(artifact => artifact.ArtifactID)
+						.ToArray();
+
+					var allObjects = this.InvokeGenericMethod(objectType, nameof(Get), childArtifactIds, depthLevel) as IEnumerable;
+
+					return BaseExtensionMethods.MakeGenericList(allObjects, objectType);
+				}
+
+				//single object
+				if (fieldType == RdoFieldType.SingleObject)
+				{
+					var childArtifact = objectRdo[fieldGuid].ValueAsSingleObject;
+					if (childArtifact == null || childArtifact.ArtifactID == 0)
+					{
+						return null;
+					}
+
+					var objectType = property.PropertyType;
+					var childArtifactId = childArtifact.ArtifactID;
+					return this.InvokeGenericMethod(objectType, nameof(Get), childArtifactId, depthLevel);
+				}
+
 			}
 
-			return theObject;
+			//child object
+			if (property.GetCustomAttribute<RelativityObjectChildrenListAttribute>() != null)
+			{
+				var childType = property.PropertyType.GetEnumerableInnerType();
+
+				var allChildObjects = this.InvokeGenericMethod(childType, nameof(GetAllChildDTOs), baseDto.ArtifactId, depthLevel) as IEnumerable;
+
+				return BaseExtensionMethods.MakeGenericList(allChildObjects, childType);
+			}
+
+			
+			return null;
 		}
-
-		public ResultSet<Document> QueryDocumentsByDocumentViewID(int documentViewId)
-		{
-			ResultSet<Document> returnObject;
-
-			Query<Document> query = new Query<Document>();
-			query.Condition = new ViewCondition(documentViewId);
-			query.Fields = FieldValue.SelectedFields;
-
-			using (IRSAPIClient proxy = CreateProxy())
-			{
-				try
-				{
-					returnObject = invokeWithRetryService.InvokeWithRetry(() => proxy.Repositories.Document.Query(query));
-				}
-				catch (Exception ex)
-				{
-					throw new ProxyOperationFailedException("Failed in method: " + System.Reflection.MethodInfo.GetCurrentMethod(), ex);
-				}
-			}
-
-			return returnObject;
-		}
-
-		public KeyValuePair<byte[], kCura.Relativity.Client.FileMetadata> DownloadDocumentNative(int documentId)
-		{
-			kCura.Relativity.Client.DTOs.Document doc = new kCura.Relativity.Client.DTOs.Document(documentId);
-			byte[] documentBytes;
-
-			KeyValuePair<DownloadResponse, Stream> documentNativeResponse = new KeyValuePair<DownloadResponse, Stream>();
-
-			using (IRSAPIClient proxy = CreateProxy())
-			{
-				try
-				{
-					documentNativeResponse = invokeWithRetryService.InvokeWithRetry(() => proxy.Repositories.Document.DownloadNative(doc));
-				}
-				catch (Exception ex)
-				{
-					throw new ProxyOperationFailedException("Failed in method: " + System.Reflection.MethodInfo.GetCurrentMethod(), ex);
-				}
-			}
-
-			using (MemoryStream ms = (MemoryStream)documentNativeResponse.Value)
-			{
-				documentBytes = ms.ToArray();
-			}
-
-			return new KeyValuePair<byte[], FileMetadata>(documentBytes, documentNativeResponse.Key.Metadata);
-		}
-
 	}
 }
